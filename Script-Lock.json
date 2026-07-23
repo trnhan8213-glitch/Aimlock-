@@ -1,1 +1,170 @@
-local Aimbot = loadstring(game:HttpGet("https://raw.githubusercontent.com/Exunys/Aimbot-V3/main/src/Aimbot.lua"))() Aimbot.Load()loadstring(game:HttpGet("https://raw.githubusercontent.com/Exunys/Aimbot-V3/main/src/Aimbot.lua"))()()loadstring(game:HttpGet("https://raw.githubusercontent.com/Exunys/Aimbot-V3/main/src/Aimbot.lua"))() ExunysDeveloperAimbot()
+local default_config = [[
+{
+    "aim_drag_strength": 0.78,
+    "smooth_factor": 0.95,
+    "deadzone_radius": 0.02,
+    "head_lock_priority": 1.2,
+    "over_aim_correction": 0.55,
+    "recoil_compensation": 0.85,
+    "max_angle_offset": 12.0,
+    "update_interval_ms": 14
+}
+]]
+
+local function load_config()
+    local config_str = nil
+    local f = io.open("config.json", "r")
+    if f then
+        config_str = f:read("*all")
+        f:close()
+    else
+        config_str = default_config
+    end
+
+    local config = {}
+    local temp = config_str:gsub("[\n\r\t ]", "")
+    for key, val in temp:gmatch('"(%w+)"%s*:%s*([%d.]+)') do
+        config[key] = tonumber(val)
+    end
+    return config
+end
+
+local cfg = load_config()
+
+local lib_name = "libil2cpp.so"
+local base_address = nil
+local aim_assist_offset = 0x12A4B7C
+local sensitivity_offset = 0x12A4D20
+local recoil_offset = 0x12A4F88
+local head_bone_offset = 0x1A2B4C0
+
+local function get_base_address()
+    if base_address then return base_address end
+    local ranges = gg.getRangesList(lib_name)
+    if ranges and #ranges > 0 then
+        base_address = ranges[1].start
+    else
+        local search = gg.searchNumber("3F800000", gg.TYPE_FLOAT, false, gg.SIGN_EQUAL, 0, -1)
+        if search then
+            local addr = search:getAddress()
+            if addr then
+                base_address = addr - aim_assist_offset
+            end
+        end
+    end
+    return base_address
+end
+
+local function create_pointer(offset)
+    local addr = get_base_address()
+    if not addr then return nil end
+    return addr + offset
+end
+
+local function read_float(address)
+    if not address then return nil end
+    local val = gg.getValues({{address = address, flags = gg.TYPE_FLOAT}})
+    if val and #val > 0 then
+        return val[1].value
+    end
+    return nil
+end
+
+local function write_float(address, value)
+    if not address then return end
+    gg.setValues({{address = address, flags = gg.TYPE_FLOAT, value = value}})
+end
+
+local function apply_aim_drag()
+    local aim_addr = create_pointer(aim_assist_offset)
+    local sens_addr = create_pointer(sensitivity_offset)
+    if not aim_addr or not sens_addr then return end
+
+    local current_aim = read_float(aim_addr) or 0.5
+    local current_sens = read_float(sens_addr) or 1.0
+
+    local target_aim = current_aim + (cfg.aim_drag_strength - current_aim) * cfg.smooth_factor
+    local target_sens = current_sens * (1.0 - cfg.deadzone_radius)
+
+    write_float(aim_addr, math.min(target_aim, 1.0))
+    write_float(sens_addr, math.max(target_sens, 0.1))
+end
+
+local function fix_shake()
+    local aim_addr = create_pointer(aim_assist_offset)
+    if not aim_addr then return end
+
+    local raw = read_float(aim_addr) or 0.5
+    local smoothed = raw * 0.80 + 0.20 * cfg.smooth_factor
+    write_float(aim_addr, smoothed)
+end
+
+local function lock_head()
+    local head_addr = create_pointer(head_bone_offset)
+    local aim_addr = create_pointer(aim_assist_offset)
+    if not head_addr or not aim_addr then return end
+
+    local head_pos = read_float(head_addr) or 0.0
+    local current_aim = read_float(aim_addr) or 0.5
+
+    local offset = (head_pos - current_aim) * cfg.head_lock_priority
+    local new_aim = current_aim + math.min(offset, cfg.max_angle_offset)
+    write_float(aim_addr, math.max(0.0, math.min(new_aim, 1.0)))
+end
+
+local function fix_over_aim()
+    local aim_addr = create_pointer(aim_assist_offset)
+    local recoil_addr = create_pointer(recoil_offset)
+    if not aim_addr or not recoil_addr then return end
+
+    local current_aim = read_float(aim_addr) or 0.5
+    local recoil_val = read_float(recoil_addr) or 0.0
+
+    local correction = (current_aim - 0.5) * cfg.over_aim_correction
+    local compensated_aim = current_aim - correction
+    local recoil_comp = recoil_val * cfg.recoil_compensation
+    compensated_aim = compensated_aim - recoil_comp
+
+    write_float(aim_addr, math.max(0.0, math.min(compensated_aim, 1.0)))
+end
+
+local function sync_framerate()
+    local interval = cfg.update_interval_ms / 1000.0
+    local start_time = os.clock()
+    while true do
+        if os.clock() - start_time >= interval then
+            break
+        end
+        gg.sleep(1)
+    end
+end
+
+local function main_loop()
+    while true do
+        if not get_base_address() then
+            gg.sleep(1000)
+            goto continue
+        end
+
+        apply_aim_drag()
+        fix_shake()
+        lock_head()
+        fix_over_aim()
+        sync_framerate()
+
+        ::continue::
+    end
+end
+
+local function init()
+    gg.setRanges(gg.REGION_ANONYMOUS | gg.REGION_C_ALLOC)
+    gg.setVisible(false)
+    local co = coroutine.create(main_loop)
+    coroutine.resume(co)
+end
+
+init()
+
+while true do
+    gg.sleep(10000)
+end
