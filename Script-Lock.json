@@ -1,170 +1,261 @@
-local default_config = [[
-{
-    "aim_drag_strength": 0.78,
-    "smooth_factor": 0.95,
-    "deadzone_radius": 0.02,
-    "head_lock_priority": 1.2,
-    "over_aim_correction": 0.55,
-    "recoil_compensation": 0.85,
-    "max_angle_offset": 12.0,
-    "update_interval_ms": 14
-}
-]]
+local function parse_json(str)
+    local idx = 1
+    local len = #str
 
-local function load_config()
-    local config_str = nil
-    local f = io.open("config.json", "r")
-    if f then
-        config_str = f:read("*all")
-        f:close()
-    else
-        config_str = default_config
+    local function skip_space()
+        while idx <= len and str:sub(idx, idx):match("%s") do
+            idx = idx + 1
+        end
     end
 
-    local config = {}
-    local temp = config_str:gsub("[\n\r\t ]", "")
-    for key, val in temp:gmatch('"(%w+)"%s*:%s*([%d.]+)') do
-        config[key] = tonumber(val)
+    local function parse_string()
+        if str:sub(idx, idx) ~= '"' then return nil end
+        idx = idx + 1
+        local s = ""
+        while idx <= len do
+            local c = str:sub(idx, idx)
+            if c == '"' then
+                idx = idx + 1
+                return s
+            elseif c == '\\' then
+                idx = idx + 1
+                local esc = str:sub(idx, idx)
+                if esc == 'n' then s = s .. '\n'
+                elseif esc == 't' then s = s .. '\t'
+                elseif esc == 'r' then s = s .. '\r'
+                elseif esc == '"' then s = s .. '"'
+                elseif esc == '\\' then s = s .. '\\'
+                else s = s .. esc end
+                idx = idx + 1
+            else
+                s = s .. c
+                idx = idx + 1
+            end
+        end
+        return nil
+    end
+
+    local function parse_number()
+        local start = idx
+        while idx <= len and str:sub(idx, idx):match("[%d%.eE+-]") do
+            idx = idx + 1
+        end
+        local num_str = str:sub(start, idx - 1)
+        local num = tonumber(num_str)
+        return num
+    end
+
+    local function parse_value()
+        skip_space()
+        local c = str:sub(idx, idx)
+        if c == '"' then
+            return parse_string()
+        elseif c == '{' then
+            return parse_object()
+        elseif c == '[' then
+            return parse_array()
+        elseif c == 't' and str:sub(idx, idx + 3) == 'true' then
+            idx = idx + 4
+            return true
+        elseif c == 'f' and str:sub(idx, idx + 4) == 'false' then
+            idx = idx + 5
+            return false
+        elseif c == 'n' and str:sub(idx, idx + 3) == 'null' then
+            idx = idx + 4
+            return nil
+        elseif c:match("[%d-]") then
+            return parse_number()
+        else
+            return nil
+        end
+    end
+
+    function parse_object()
+        if str:sub(idx, idx) ~= '{' then return nil end
+        idx = idx + 1
+        skip_space()
+        local obj = {}
+        if str:sub(idx, idx) == '}' then
+            idx = idx + 1
+            return obj
+        end
+        while true do
+            skip_space()
+            local key = parse_string()
+            if not key then return nil end
+            skip_space()
+            if str:sub(idx, idx) ~= ':' then return nil end
+            idx = idx + 1
+            skip_space()
+            local val = parse_value()
+            if val == nil and str:sub(idx, idx) ~= 'n' then
+                return nil
+            end
+            obj[key] = val
+            skip_space()
+            if str:sub(idx, idx) == '}' then
+                idx = idx + 1
+                break
+            elseif str:sub(idx, idx) == ',' then
+                idx = idx + 1
+            else
+                return nil
+            end
+        end
+        return obj
+    end
+
+    function parse_array()
+        if str:sub(idx, idx) ~= '[' then return nil end
+        idx = idx + 1
+        skip_space()
+        local arr = {}
+        if str:sub(idx, idx) == ']' then
+            idx = idx + 1
+            return arr
+        end
+        while true do
+            skip_space()
+            local val = parse_value()
+            if val == nil and str:sub(idx, idx) ~= 'n' then
+                return nil
+            end
+            table.insert(arr, val)
+            skip_space()
+            if str:sub(idx, idx) == ']' then
+                idx = idx + 1
+                break
+            elseif str:sub(idx, idx) == ',' then
+                idx = idx + 1
+            else
+                return nil
+            end
+        end
+        return arr
+    end
+
+    skip_space()
+    local result = parse_value()
+    skip_space()
+    if idx <= len then return nil end
+    return result
+end
+
+local function load_config()
+    local f = io.open("config.json", "r")
+    if not f then
+        return {
+            aim_drag_strength = 0.78,
+            smooth_factor = 0.95,
+            deadzone_radius = 0.02,
+            head_lock_priority = 1.2,
+            over_aim_correction = 0.55,
+            recoil_compensation = 0.85,
+            max_angle_offset = 12.0,
+            update_interval_ms = 14
+        }
+    end
+    local s = f:read("*all")
+    f:close()
+    local config = parse_json(s)
+    if not config or type(config) ~= "table" then
+        return {
+            aim_drag_strength = 0.78,
+            smooth_factor = 0.95,
+            deadzone_radius = 0.02,
+            head_lock_priority = 1.2,
+            over_aim_correction = 0.55,
+            recoil_compensation = 0.85,
+            max_angle_offset = 12.0,
+            update_interval_ms = 14
+        }
     end
     return config
 end
 
 local cfg = load_config()
 
-local lib_name = "libil2cpp.so"
-local base_address = nil
 local aim_assist_offset = 0x12A4B7C
 local sensitivity_offset = 0x12A4D20
 local recoil_offset = 0x12A4F88
 local head_bone_offset = 0x1A2B4C0
 
-local function get_base_address()
+local base_address = nil
+
+local function get_base()
     if base_address then return base_address end
-    local ranges = gg.getRangesList(lib_name)
+    local ranges = gg.getRangesList("libil2cpp.so")
     if ranges and #ranges > 0 then
         base_address = ranges[1].start
-    else
-        local search = gg.searchNumber("3F800000", gg.TYPE_FLOAT, false, gg.SIGN_EQUAL, 0, -1)
-        if search then
-            local addr = search:getAddress()
-            if addr then
-                base_address = addr - aim_assist_offset
-            end
+        return base_address
+    end
+    local search = gg.searchNumber("3F800000", gg.TYPE_FLOAT, false, gg.SIGN_EQUAL, 0, -1)
+    if search then
+        local addr = search:getAddress()
+        if addr then
+            base_address = addr - aim_assist_offset
         end
     end
     return base_address
 end
 
-local function create_pointer(offset)
-    local addr = get_base_address()
+local function read_float(addr)
     if not addr then return nil end
-    return addr + offset
-end
-
-local function read_float(address)
-    if not address then return nil end
-    local val = gg.getValues({{address = address, flags = gg.TYPE_FLOAT}})
+    local val = gg.getValues({{address = addr, flags = gg.TYPE_FLOAT}})
     if val and #val > 0 then
         return val[1].value
     end
     return nil
 end
 
-local function write_float(address, value)
-    if not address then return end
-    gg.setValues({{address = address, flags = gg.TYPE_FLOAT, value = value}})
+local function write_float(addr, val)
+    if not addr then return end
+    gg.setValues({{address = addr, flags = gg.TYPE_FLOAT, value = val}})
 end
 
-local function apply_aim_drag()
-    local aim_addr = create_pointer(aim_assist_offset)
-    local sens_addr = create_pointer(sensitivity_offset)
-    if not aim_addr or not sens_addr then return end
-
-    local current_aim = read_float(aim_addr) or 0.5
-    local current_sens = read_float(sens_addr) or 1.0
-
-    local target_aim = current_aim + (cfg.aim_drag_strength - current_aim) * cfg.smooth_factor
-    local target_sens = current_sens * (1.0 - cfg.deadzone_radius)
-
-    write_float(aim_addr, math.min(target_aim, 1.0))
-    write_float(sens_addr, math.max(target_sens, 0.1))
+local function pointer(off)
+    local base = get_base()
+    if not base then return nil end
+    return base + off
 end
 
-local function fix_shake()
-    local aim_addr = create_pointer(aim_assist_offset)
-    if not aim_addr then return end
-
-    local raw = read_float(aim_addr) or 0.5
-    local smoothed = raw * 0.80 + 0.20 * cfg.smooth_factor
-    write_float(aim_addr, smoothed)
-end
-
-local function lock_head()
-    local head_addr = create_pointer(head_bone_offset)
-    local aim_addr = create_pointer(aim_assist_offset)
-    if not head_addr or not aim_addr then return end
-
-    local head_pos = read_float(head_addr) or 0.0
-    local current_aim = read_float(aim_addr) or 0.5
-
-    local offset = (head_pos - current_aim) * cfg.head_lock_priority
-    local new_aim = current_aim + math.min(offset, cfg.max_angle_offset)
-    write_float(aim_addr, math.max(0.0, math.min(new_aim, 1.0)))
-end
-
-local function fix_over_aim()
-    local aim_addr = create_pointer(aim_assist_offset)
-    local recoil_addr = create_pointer(recoil_offset)
-    if not aim_addr or not recoil_addr then return end
-
-    local current_aim = read_float(aim_addr) or 0.5
-    local recoil_val = read_float(recoil_addr) or 0.0
-
-    local correction = (current_aim - 0.5) * cfg.over_aim_correction
-    local compensated_aim = current_aim - correction
-    local recoil_comp = recoil_val * cfg.recoil_compensation
-    compensated_aim = compensated_aim - recoil_comp
-
-    write_float(aim_addr, math.max(0.0, math.min(compensated_aim, 1.0)))
-end
-
-local function sync_framerate()
-    local interval = cfg.update_interval_ms / 1000.0
-    local start_time = os.clock()
-    while true do
-        if os.clock() - start_time >= interval then
-            break
-        end
-        gg.sleep(1)
-    end
-end
-
-local function main_loop()
-    while true do
-        if not get_base_address() then
-            gg.sleep(1000)
-            goto continue
-        end
-
-        apply_aim_drag()
-        fix_shake()
-        lock_head()
-        fix_over_aim()
-        sync_framerate()
-
-        ::continue::
-    end
-end
-
-local function init()
-    gg.setRanges(gg.REGION_ANONYMOUS | gg.REGION_C_ALLOC)
-    gg.setVisible(false)
-    local co = coroutine.create(main_loop)
-    coroutine.resume(co)
-end
-
-init()
+gg.setRanges(gg.REGION_ANONYMOUS | gg.REGION_C_ALLOC)
+gg.setVisible(false)
 
 while true do
-    gg.sleep(10000)
+    if not get_base() then
+        gg.sleep(1000)
+    else
+        local aim_ptr = pointer(aim_assist_offset)
+        local sens_ptr = pointer(sensitivity_offset)
+        local recoil_ptr = pointer(recoil_offset)
+        local head_ptr = pointer(head_bone_offset)
+
+        if aim_ptr and sens_ptr and recoil_ptr and head_ptr then
+            local cur_aim = read_float(aim_ptr) or 0.5
+            local cur_sens = read_float(sens_ptr) or 1.0
+            local cur_recoil = read_float(recoil_ptr) or 0.0
+            local cur_head = read_float(head_ptr) or 0.0
+
+            local new_aim = cur_aim + (cfg.aim_drag_strength - cur_aim) * cfg.smooth_factor
+            write_float(aim_ptr, math.min(new_aim, 1.0))
+
+            local smoothed = cur_aim * 0.80 + 0.20 * cfg.smooth_factor
+            write_float(aim_ptr, smoothed)
+
+            local head_off = (cur_head - cur_aim) * cfg.head_lock_priority
+            local head_locked = cur_aim + math.min(head_off, cfg.max_angle_offset)
+            write_float(aim_ptr, math.max(0.0, math.min(head_locked, 1.0)))
+
+            local over = (cur_aim - 0.5) * cfg.over_aim_correction
+            local recoil_comp = cur_recoil * cfg.recoil_compensation
+            local final_aim = cur_aim - over - recoil_comp
+            write_float(aim_ptr, math.max(0.0, math.min(final_aim, 1.0)))
+
+            local new_sens = cur_sens * (1.0 - cfg.deadzone_radius)
+            write_float(sens_ptr, math.max(0.1, new_sens))
+        end
+
+        gg.sleep(cfg.update_interval_ms)
+    end
 end
