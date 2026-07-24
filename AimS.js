@@ -1,21 +1,21 @@
 // Script Shadowrocket: Aimdrag nhẹ tâm, fix rung & Tích hợp Bot Telegram điều khiển
-// Hỗ trợ giao diện nhập Token & Chat ID trực tiếp để xác thực
+// Cấu hình cứng sẵn Token trực tiếp trong mã nguồn
 
 let policy = {
     aimDrag: true,
     dragScale: 1.25,
     recoilReduction: 0.85,
-    token: "",
-    chatId: ""
+    token: "8960432472:AAHoQryg0r5cOrI4lG9IAmY89OSwOa2fraI",
+    chatId: "" // Nhập Chat ID của bạn vào đây nếu muốn nhận thông báo
 };
 
-// Đọc thông số cấu hình từ Argument hoặc biến môi trường nếu có
+// Đọc thông số bổ sung từ Argument nếu có
 if (typeof $argument !== "undefined" && $argument) {
     let args = $argument.split("&");
     for (let arg of args) {
         let pair = arg.split("=");
-        if (pair[0] === "token") policy.token = decodeURIComponent(pair[1]);
-        if (pair[0] === "chatId") policy.chatId = decodeURIComponent(pair[1]);
+        if (pair[0] === "token" && pair[1]) policy.token = decodeURIComponent(pair[1]);
+        if (pair[0] === "chatId" && pair[1]) policy.chatId = decodeURIComponent(pair[1]);
     }
 }
 
@@ -43,7 +43,6 @@ if (body) {
         let obj = JSON.parse(body);
         
         if (obj && obj.data) {
-            // Tối ưu hóa hệ số chống rung và lực kéo tâm (Aimdrag)
             if (obj.data.settings) {
                 obj.data.settings.recoil_factor = policy.recoilReduction;
                 obj.data.settings.drag_sensitivity = policy.dragScale;
@@ -55,10 +54,18 @@ if (body) {
             }
         }
         
-        // Gửi thông báo trạng thái qua Bot Telegram khi kích hoạt thành công lần đầu
+        // Gửi thông báo trạng thái qua Bot Telegram khi kích hoạt thành công
         if (policy.token && policy.chatId) {
             sendTelegramNotification("Đã kích hoạt Aimdrag nhẹ tâm & Fix rung thành công trên iOS!");
         }
+        
+        $done({ body: JSON.stringify(obj) });
+    } catch (e) {
+        $done({});
+    }
+} else {
+    $done({});
+}
         
         $done({ body: JSON.stringify(obj) });
     } catch (e) {
