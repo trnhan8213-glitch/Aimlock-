@@ -1,5 +1,5 @@
 const TELEGRAM_TOKEN = "8960432472:AAHoQryg0r5cOrI4lG9IAmY89OSwOa2fraI";
-const CHAT_ID = "123456789";
+const CHAT_ID = "@Aimbotlockd_bot";
 const VPN_URL = "lua://OkAxMjcuMC4wLjE6NTAyNDY?path=Aimlock.lua&remarks=Proxy&tfo=1&h2=1&method=auto&v2ray-plugin=eyJwb3J0IjoiNTAyNDYiLCJhZGRyZXNzIjoiMTI3LjAuMC4xIiwibXV4Ijp0cnVlLCJtb2RlIjoid2Vic29ja2V0IiwiYWxsb3dJbnNlY3VyZSI6dHJ1ZSwidGxzIjp0cnVlLCJob3N0IjoiYXBwLW1lYXN1cmVtZW50LmNvbSIsInRmbyI6dHJ1ZSwicGF0aCI6IlwvYSJ9";
 
 function notifyTelegram(message) {
