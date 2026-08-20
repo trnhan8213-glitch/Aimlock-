@@ -1,5 +1,4 @@
-# .github/workflows/build.yml
-name: Build FreeFire Aimlock dylib
+name: Build iOS Dylib
 
 on:
   push:
@@ -9,190 +8,435 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    
     steps:
-    - uses: actions/checkout@v3
-
-    - name: Create FreeFire Aimlock source
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Install iOS SDK
       run: |
-        cat > aimlock.c << 'EOF'
-        #define _GNU_SOURCE
+        sudo xcode-select -switch /Applications/Xcode.app
+        xcodebuild -showsdks
+    
+    - name: Create CMakeLists.txt
+      run: |
+        cat > CMakeLists.txt << 'EOF'
+        cmake_minimum_required(VERSION 3.15)
+        project(AimlockMenu)
+        
+        set(CMAKE_CXX_STANDARD 17)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -mios-version-min=14.0 -fPIC -shared")
+        
+        add_library(aimlock_menu SHARED aimlock_menu.cpp)
+        target_link_libraries(aimlock_menu "-framework Foundation -framework UIKit -framework CoreGraphics")
+        EOF
+    
+    - name: Create source file
+      run: |
+        cat > aimlock_menu.cpp << 'EOF'
         #include <stdio.h>
         #include <stdlib.h>
         #include <string.h>
-        #include <dlfcn.h>
-        #include <pthread.h>
         #include <unistd.h>
-        #include <sys/uio.h>
+        #include <pthread.h>
         #include <mach/mach.h>
-        #include <mach/vm_map.h>
-
+        #include <mach-o/dyld.h>
+        #include <dlfcn.h>
+        #include <Foundation/Foundation.h>
+        #include <UIKit/UIKit.h>
+        
+        #define AIMBOT_FOV 60.0f
+        #define AIMBOT_SMOOTH 0.5f
+        #define MAX_PLAYERS 64
+        #define OFFSET_ENTITY_LIST 0x12345678
+        #define OFFSET_VIEW_MATRIX 0x87654321
+        
         typedef struct {
-            float x;
-            float y;
-            float z;
-        } Vector3;
-
+            float x, y, z;
+        } Vec3;
+        
         typedef struct {
-            Vector3 position;
-            Vector3 head_position;
+            Vec3 head;
+            Vec3 position;
             float health;
-            float distance;
-            int is_visible;
-            int team_id;
-            int player_id;
+            bool is_alive;
+            bool is_visible;
+            uint64_t address;
         } PlayerEntity;
-
+        
         typedef struct {
-            Vector3 view_angles;
-            Vector3 camera_position;
-            float fov;
-            int screen_width;
-            int screen_height;
-        } CameraState;
-
-        static int aimlock_enabled = 1;
-        static int triggerbot_enabled = 1;
-        static float aim_fov = 15.0f;
-        static float smooth_factor = 0.3f;
-        static int target_priority = 0;
-        static int aim_key = 0;
-        static pthread_t aim_thread;
-        static volatile int thread_running = 0;
-        static mach_port_t task_port = MACH_PORT_NULL;
-
-        static int (*original_strstr)(const char *, const char *) = NULL;
-        static void *(*original_dlsym)(void *, const char *) = NULL;
-
-        int hooked_strstr(const char *haystack, const char *needle) {
-            const char *blocked[] = {"cheat", "hack", "mod", "inject", "bypass", "aimbot", "wallhack", NULL};
-            for (int i = 0; blocked[i] != NULL; i++) {
-                if (strstr(haystack, blocked[i]) != NULL) {
-                    return 0;
+            float m[16];
+        } Matrix4x4;
+        
+        static bool g_menu_visible = false;
+        static bool g_aimbot_enabled = true;
+        static bool g_aimbot_visible_only = true;
+        static float g_aimbot_fov = AIMBOT_FOV;
+        static float g_aimbot_smooth = AIMBOT_SMOOTH;
+        
+        static uint64_t g_game_base = 0;
+        static PlayerEntity g_players[MAX_PLAYERS];
+        static int g_player_count = 0;
+        static uint64_t g_local_player_ptr = 0;
+        
+        static pthread_t g_menu_thread;
+        static pthread_t g_aimbot_thread;
+        static bool g_threads_running = false;
+        
+        static uint64_t read_uint64(uint64_t addr) {
+            if (addr == 0) return 0;
+            uint64_t value = 0;
+            mach_vm_size_t size = sizeof(uint64_t);
+            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr, size, (mach_vm_address_t)&value, &size);
+            return value;
+        }
+        
+        static uint32_t read_uint32(uint64_t addr) {
+            if (addr == 0) return 0;
+            uint32_t value = 0;
+            mach_vm_size_t size = sizeof(uint32_t);
+            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr, size, (mach_vm_address_t)&value, &size);
+            return value;
+        }
+        
+        static float read_float(uint64_t addr) {
+            if (addr == 0) return 0.0f;
+            float value = 0.0f;
+            mach_vm_size_t size = sizeof(float);
+            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr, size, (mach_vm_address_t)&value, &size);
+            return value;
+        }
+        
+        static void write_float(uint64_t addr, float value) {
+            if (addr == 0) return;
+            mach_vm_size_t size = sizeof(float);
+            mach_vm_write(mach_task_self(), (mach_vm_address_t)addr, (vm_offset_t)&value, size);
+        }
+        
+        static uint64_t get_game_base(void) {
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const char* name = _dyld_get_image_name(i);
+                if (name && strstr(name, "FreeFire") != NULL) {
+                    return (uint64_t)_dyld_get_image_header(i);
                 }
             }
-            return original_strstr(haystack, needle);
-        }
-
-        void *hooked_dlsym(void *handle, const char *symbol) {
-            if (strstr(symbol, "check") || strstr(symbol, "ban") || strstr(symbol, "detect")) {
-                return NULL;
-            }
-            return original_dlsym(handle, symbol);
-        }
-
-        static Vector3 calculate_angle(Vector3 source, Vector3 target) {
-            Vector3 delta;
-            delta.x = target.x - source.x;
-            delta.y = target.y - source.y;
-            delta.z = target.z - source.z;
-            float distance = sqrtf(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z);
-            Vector3 angle;
-            angle.x = atan2f(delta.y, delta.x) * 180.0f / M_PI;
-            angle.y = -asinf(delta.z / distance) * 180.0f / M_PI;
-            angle.z = 0.0f;
-            return angle;
-        }
-
-        static float calculate_distance(Vector3 a, Vector3 b) {
-            float dx = a.x - b.x;
-            float dy = a.y - b.y;
-            float dz = a.z - b.z;
-            return sqrtf(dx*dx + dy*dy + dz*dz);
-        }
-
-        static int is_within_fov(Vector3 current_angle, Vector3 target_angle, float fov) {
-            float diff_x = fabsf(current_angle.x - target_angle.x);
-            float diff_y = fabsf(current_angle.y - target_angle.y);
-            return (diff_x <= fov && diff_y <= fov);
-        }
-
-        static Vector3 smooth_aim(Vector3 current, Vector3 target, float smooth) {
-            Vector3 result;
-            result.x = current.x + (target.x - current.x) * smooth;
-            result.y = current.y + (target.y - current.y) * smooth;
-            result.z = 0.0f;
-            return result;
-        }
-
-        static void apply_anti_ban(void) {
-            original_strstr = dlsym(RTLD_NEXT, "strstr");
-            if (original_strstr) {
-                void **ptr = dlsym(RTLD_DEFAULT, "strstr");
-                if (ptr) *ptr = (void*)hooked_strstr;
-            }
-            original_dlsym = dlsym(RTLD_NEXT, "dlsym");
-            if (original_dlsym) {
-                void **ptr = dlsym(RTLD_DEFAULT, "dlsym");
-                if (ptr) *ptr = (void*)hooked_dlsym;
-            }
-        }
-
-        static void bypass_antiband(void) {
-            float fake_accel[3] = {0.0f, 0.0f, 0.0f};
-            int touch_speed = 0;
-            float sensitivity = 100.0f;
-            int aim_assist_bypass = 0xDEADBEEF;
-        }
-
-        __attribute__((constructor)) void init_aimlock() {
-            task_port = mach_task_self();
-            apply_anti_ban();
-            bypass_antiband();
-            printf("[Aimlock] Loaded successfully\n");
-        }
-
-        __attribute__((destructor)) void cleanup_aimlock() {
-            thread_running = 0;
-            if (aim_thread) pthread_join(aim_thread, NULL);
-            printf("[Aimlock] Unloaded\n");
-        }
-
-        int enable_aimlock(void) {
-            aimlock_enabled = 1;
-            return 1;
-        }
-
-        int disable_aimlock(void) {
-            aimlock_enabled = 0;
             return 0;
         }
-
-        int set_fov(float fov) {
-            if (fov < 1.0f) fov = 1.0f;
-            if (fov > 90.0f) fov = 90.0f;
-            aim_fov = fov;
-            return 1;
+        
+        static bool world_to_screen(Vec3 world, Vec3* screen, Matrix4x4* view_matrix) {
+            float w = view_matrix->m[3] * world.x + view_matrix->m[7] * world.y +
+                      view_matrix->m[11] * world.z + view_matrix->m[15];
+            
+            if (w < 0.001f) return false;
+            
+            float inv_w = 1.0f / w;
+            screen->x = (view_matrix->m[0] * world.x + view_matrix->m[4] * world.y +
+                         view_matrix->m[8] * world.z + view_matrix->m[12]) * inv_w;
+            screen->y = (view_matrix->m[1] * world.x + view_matrix->m[5] * world.y +
+                         view_matrix->m[9] * world.z + view_matrix->m[13]) * inv_w;
+            
+            screen->x = (screen->x + 1.0f) * 0.5f;
+            screen->y = (1.0f - screen->y) * 0.5f;
+            
+            return true;
         }
-
-        int set_smooth(float smooth) {
-            if (smooth < 0.01f) smooth = 0.01f;
-            if (smooth > 1.0f) smooth = 1.0f;
-            smooth_factor = smooth;
-            return 1;
+        
+        static Matrix4x4 get_view_matrix(void) {
+            Matrix4x4 mat = {0};
+            if (g_game_base == 0) return mat;
+            uint64_t view_addr = g_game_base + OFFSET_VIEW_MATRIX;
+            for (int i = 0; i < 16; i++) {
+                mat.m[i] = read_float(view_addr + i * sizeof(float));
+            }
+            return mat;
         }
-
-        int set_priority(int priority) {
-            target_priority = (priority >= 0 && priority <= 1) ? priority : 0;
-            return 1;
+        
+        static void update_players(void) {
+            if (g_game_base == 0) return;
+            uint64_t entity_list_addr = g_game_base + OFFSET_ENTITY_LIST;
+            g_player_count = 0;
+            
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                uint64_t player_ptr = read_uint64(entity_list_addr + i * sizeof(uint64_t));
+                if (player_ptr == 0) continue;
+                
+                float health = read_float(player_ptr + 0x100);
+                if (health <= 0.0f) continue;
+                
+                Vec3 pos;
+                pos.x = read_float(player_ptr + 0x200);
+                pos.y = read_float(player_ptr + 0x204);
+                pos.z = read_float(player_ptr + 0x208);
+                
+                Vec3 head;
+                head.x = read_float(player_ptr + 0x300);
+                head.y = read_float(player_ptr + 0x304);
+                head.z = read_float(player_ptr + 0x308);
+                
+                g_players[g_player_count].address = player_ptr;
+                g_players[g_player_count].health = health;
+                g_players[g_player_count].position = pos;
+                g_players[g_player_count].head = head;
+                g_players[g_player_count].is_alive = true;
+                g_players[g_player_count].is_visible = true;
+                g_player_count++;
+                
+                if (g_player_count >= MAX_PLAYERS) break;
+            }
         }
-
-        int toggle_triggerbot(void) {
-            triggerbot_enabled = !triggerbot_enabled;
-            return triggerbot_enabled;
+        
+        static uint64_t get_closest_player(Vec3 local_pos, float* out_distance) {
+            uint64_t target = 0;
+            float min_dist = g_aimbot_fov;
+            
+            for (int i = 0; i < g_player_count; i++) {
+                if (!g_players[i].is_alive) continue;
+                if (g_aimbot_visible_only && !g_players[i].is_visible) continue;
+                
+                Vec3 delta;
+                delta.x = g_players[i].head.x - local_pos.x;
+                delta.y = g_players[i].head.y - local_pos.y;
+                delta.z = g_players[i].head.z - local_pos.z;
+                
+                float dist = sqrtf(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    target = g_players[i].address;
+                    if (out_distance) *out_distance = dist;
+                }
+            }
+            return target;
         }
-
-        int get_status(void) {
-            return aimlock_enabled ? 1 : 0;
+        
+        static void aimbot_thread_func(void* arg) {
+            while (g_threads_running) {
+                if (!g_aimbot_enabled || g_game_base == 0) {
+                    usleep(100000);
+                    continue;
+                }
+                
+                uint64_t local = read_uint64(g_game_base + 0xDEADBEEF);
+                if (local == 0) {
+                    usleep(100000);
+                    continue;
+                }
+                
+                Vec3 local_pos;
+                local_pos.x = read_float(local + 0x200);
+                local_pos.y = read_float(local + 0x204);
+                local_pos.z = read_float(local + 0x208);
+                
+                update_players();
+                
+                float dist = 0;
+                uint64_t target = get_closest_player(local_pos, &dist);
+                if (target == 0) {
+                    usleep(100000);
+                    continue;
+                }
+                
+                Vec3 target_head;
+                target_head.x = read_float(target + 0x300);
+                target_head.y = read_float(target + 0x304);
+                target_head.z = read_float(target + 0x308);
+                
+                Vec3 delta;
+                delta.x = target_head.x - local_pos.x;
+                delta.y = target_head.y - local_pos.y;
+                delta.z = target_head.z - local_pos.z;
+                
+                float yaw = atan2f(delta.z, delta.x) * 180.0f / M_PI;
+                float pitch = atan2f(delta.y, sqrtf(delta.x*delta.x + delta.z*delta.z)) * 180.0f / M_PI;
+                
+                uint64_t camera_ptr = read_uint64(g_game_base + 0xCAFEBABE);
+                if (camera_ptr) {
+                    float current_yaw = read_float(camera_ptr + 0x400);
+                    float current_pitch = read_float(camera_ptr + 0x404);
+                    
+                    float smooth_factor = g_aimbot_smooth;
+                    float new_yaw = current_yaw + (yaw - current_yaw) * smooth_factor;
+                    float new_pitch = current_pitch + (pitch - current_pitch) * smooth_factor;
+                    
+                    write_float(camera_ptr + 0x400, new_yaw);
+                    write_float(camera_ptr + 0x404, new_pitch);
+                }
+                
+                usleep(15000);
+            }
+            return NULL;
+        }
+        
+        @interface AimlockMenuViewController : UIViewController
+        @property (nonatomic, strong) UISwitch *aimbotSwitch;
+        @property (nonatomic, strong) UISwitch *visibleOnlySwitch;
+        @property (nonatomic, strong) UISlider *fovSlider;
+        @property (nonatomic, strong) UISlider *smoothSlider;
+        @property (nonatomic, strong) UILabel *fovLabel;
+        @property (nonatomic, strong) UILabel *smoothLabel;
+        @end
+        
+        @implementation AimlockMenuViewController
+        
+        - (void)viewDidLoad {
+            [super viewDidLoad];
+            self.view.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.8];
+            self.view.layer.cornerRadius = 12.0;
+            self.view.layer.borderWidth = 1.0;
+            self.view.layer.borderColor = [UIColor greenColor].CGColor;
+            
+            UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(10, 10, 200, 30)];
+            title.text = @"Aimlock Menu";
+            title.textColor = [UIColor greenColor];
+            title.font = [UIFont boldSystemFontOfSize:18];
+            [self.view addSubview:title];
+            
+            UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            closeBtn.frame = CGRectMake(220, 10, 60, 30);
+            [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+            [closeBtn setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
+            [closeBtn addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
+            [self.view addSubview:closeBtn];
+            
+            UILabel *aimLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 50, 120, 30)];
+            aimLabel.text = @"Aimbot";
+            aimLabel.textColor = [UIColor whiteColor];
+            [self.view addSubview:aimLabel];
+            
+            self.aimbotSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(140, 50, 50, 30)];
+            self.aimbotSwitch.on = g_aimbot_enabled;
+            [self.aimbotSwitch addTarget:self action:@selector(toggleAimbot:) forControlEvents:UIControlEventValueChanged];
+            [self.view addSubview:self.aimbotSwitch];
+            
+            UILabel *visLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 90, 120, 30)];
+            visLabel.text = @"Visible Only";
+            visLabel.textColor = [UIColor whiteColor];
+            [self.view addSubview:visLabel];
+            
+            self.visibleOnlySwitch = [[UISwitch alloc] initWithFrame:CGRectMake(140, 90, 50, 30)];
+            self.visibleOnlySwitch.on = g_aimbot_visible_only;
+            [self.visibleOnlySwitch addTarget:self action:@selector(toggleVisibleOnly:) forControlEvents:UIControlEventValueChanged];
+            [self.view addSubview:self.visibleOnlySwitch];
+            
+            self.fovLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 130, 120, 30)];
+            self.fovLabel.text = [NSString stringWithFormat:@"FOV: %.1f", g_aimbot_fov];
+            self.fovLabel.textColor = [UIColor whiteColor];
+            [self.view addSubview:self.fovLabel];
+            
+            self.fovSlider = [[UISlider alloc] initWithFrame:CGRectMake(130, 130, 140, 30)];
+            self.fovSlider.minimumValue = 10.0;
+            self.fovSlider.maximumValue = 120.0;
+            self.fovSlider.value = g_aimbot_fov;
+            [self.fovSlider addTarget:self action:@selector(fovChanged:) forControlEvents:UIControlEventValueChanged];
+            [self.view addSubview:self.fovSlider];
+            
+            self.smoothLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 170, 120, 30)];
+            self.smoothLabel.text = [NSString stringWithFormat:@"Smooth: %.2f", g_aimbot_smooth];
+            self.smoothLabel.textColor = [UIColor whiteColor];
+            [self.view addSubview:self.smoothLabel];
+            
+            self.smoothSlider = [[UISlider alloc] initWithFrame:CGRectMake(130, 170, 140, 30)];
+            self.smoothSlider.minimumValue = 0.1;
+            self.smoothSlider.maximumValue = 1.0;
+            self.smoothSlider.value = g_aimbot_smooth;
+            [self.smoothSlider addTarget:self action:@selector(smoothChanged:) forControlEvents:UIControlEventValueChanged];
+            [self.view addSubview:self.smoothSlider];
+        }
+        
+        - (void)closeMenu {
+            g_menu_visible = false;
+            [self dismissViewControllerAnimated:YES completion:nil];
+        }
+        
+        - (void)toggleAimbot:(UISwitch *)sender {
+            g_aimbot_enabled = sender.on;
+        }
+        
+        - (void)toggleVisibleOnly:(UISwitch *)sender {
+            g_aimbot_visible_only = sender.on;
+        }
+        
+        - (void)fovChanged:(UISlider *)sender {
+            g_aimbot_fov = sender.value;
+            self.fovLabel.text = [NSString stringWithFormat:@"FOV: %.1f", g_aimbot_fov];
+        }
+        
+        - (void)smoothChanged:(UISlider *)sender {
+            g_aimbot_smooth = sender.value;
+            self.smoothLabel.text = [NSString stringWithFormat:@"Smooth: %.2f", g_aimbot_smooth];
+        }
+        
+        @end
+        
+        static void show_menu(void) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (g_menu_visible) return;
+                g_menu_visible = true;
+                
+                UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+                AimlockMenuViewController *menuVC = [[AimlockMenuViewController alloc] init];
+                menuVC.modalPresentationStyle = UIModalPresentationOverCurrentContext;
+                menuVC.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+                [root presentViewController:menuVC animated:YES completion:nil];
+            });
+        }
+        
+        static void menu_thread_func(void* arg) {
+            while (g_threads_running) {
+                static int counter = 0;
+                counter++;
+                if (counter % 50 == 0) {
+                    if (g_menu_visible) {
+                        g_menu_visible = false;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            UIViewController *root = [UIApplication sharedApplication].keyWindow.rootViewController;
+                            [root dismissViewControllerAnimated:YES completion:nil];
+                        });
+                    } else {
+                        show_menu();
+                    }
+                }
+                sleep(1);
+            }
+            return NULL;
+        }
+        
+        __attribute__((constructor))
+        static void initialize(void) {
+            g_game_base = get_game_base();
+            if (g_game_base == 0) {
+                sleep(1);
+                g_game_base = get_game_base();
+            }
+            
+            g_threads_running = true;
+            pthread_create(&g_aimbot_thread, NULL, (void* (*)(void*))aimbot_thread_func, NULL);
+            pthread_create(&g_menu_thread, NULL, (void* (*)(void*))menu_thread_func, NULL);
+            
+            NSLog(@"[Aimlock] Initialized. Base: 0x%llX", g_game_base);
+        }
+        
+        __attribute__((destructor))
+        static void deinitialize(void) {
+            g_threads_running = false;
+            pthread_join(g_aimbot_thread, NULL);
+            pthread_join(g_menu_thread, NULL);
+            NSLog(@"[Aimlock] Deinitialized.");
         }
         EOF
-
-    - name: Compile for iOS arm64
+    
+    - name: Download ios.toolchain.cmake
       run: |
-        gcc -arch arm64 -shared -fPIC -o libaimlock.dylib aimlock.c \
-          -Wall -Wextra -O2 -mios-version-min=13.0
-
-    - name: Upload dylib artifact
+        curl -L -o ios.toolchain.cmake https://raw.githubusercontent.com/leetal/ios-cmake/master/ios.toolchain.cmake
+    
+    - name: Build with CMake
+      run: |
+        mkdir build && cd build
+        cmake -DCMAKE_TOOLCHAIN_FILE=../ios.toolchain.cmake -DPLATFORM=OS64 ..
+        make
+    
+    - name: Upload dylib
       uses: actions/upload-artifact@v3
       with:
-        name: libaimlock
-        path: libaimlock.dylib
+        name: aimlock_menu.dylib
+        path: build/libaimlock_menu.dylib
