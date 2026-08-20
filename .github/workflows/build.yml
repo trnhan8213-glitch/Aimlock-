@@ -1,0 +1,633 @@
+# .github/workflows/build.yml
+name: Build FreeFire Aimlock dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Create FreeFire Aimlock source
+      run: |
+        cat > aimlock.c << 'EOF'
+        #define _GNU_SOURCE
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <dlfcn.h>
+        #include <pthread.h>
+        #include <unistd.h>
+        #include <sys/uio.h>
+        #include <mach/mach.h>
+        #include <mach/vm_map.h>
+        #include <mach-o/dyld.h>
+        #include <mach-o/loader.h>
+        #include <mach-o/nlist.h>
+
+        typedef struct {
+            float x;
+            float y;
+            float z;
+        } Vector3;
+
+        typedef struct {
+            Vector3 position;
+            Vector3 head_position;
+            float health;
+            float distance;
+            int is_visible;
+            int team_id;
+            int player_id;
+        } PlayerEntity;
+
+        typedef struct {
+            Vector3 view_angles;
+            Vector3 camera_position;
+            float fov;
+            int screen_width;
+            int screen_height;
+        } CameraState;
+
+        static int aimlock_enabled = 1;
+        static int triggerbot_enabled = 1;
+        static float aim_fov = 15.0f;
+        static float smooth_factor = 0.3f;
+        static int target_priority = 0;
+        static int aim_key = 0;
+        static pthread_t aim_thread;
+        static volatile int thread_running = 0;
+        static mach_port_t task_port = MACH_PORT_NULL;
+
+        static vm_address_t OFFSET_ENTITY_LIST = 0;
+        static vm_address_t OFFSET_PLAYER_COUNT = 0;
+        static vm_address_t OFFSET_LOCAL_PLAYER = 0;
+        static vm_address_t OFFSET_VIEW_ANGLES = 0;
+        static vm_address_t OFFSET_CAMERA_POS = 0;
+        static vm_address_t OFFSET_ENTITY_POS = 0;
+        static vm_address_t OFFSET_ENTITY_HEAD = 0;
+        static vm_address_t OFFSET_ENTITY_HEALTH = 0;
+        static vm_address_t OFFSET_ENTITY_VISIBLE = 0;
+        static vm_address_t OFFSET_ENTITY_TEAM = 0;
+        static vm_address_t OFFSET_ENTITY_ID = 0;
+        static vm_address_t OFFSET_FIRE_BUTTON = 0;
+        static vm_address_t OFFSET_CRASH_FLAG = 0;
+        static vm_address_t OFFSET_CHECK_FUNC = 0;
+        static vm_address_t OFFSET_ACCELEROMETER = 0;
+        static vm_address_t OFFSET_TOUCH_SPEED = 0;
+        static vm_address_t OFFSET_SENSITIVITY = 0;
+        static vm_address_t OFFSET_AIM_ASSIST = 0;
+
+        static kern_return_t read_memory(vm_address_t address, void *buffer, size_t size) {
+            vm_size_t out_size;
+            return vm_read_overwrite(task_port, address, size, (vm_address_t)buffer, &out_size);
+        }
+
+        static kern_return_t write_memory(vm_address_t address, void *buffer, size_t size) {
+            return vm_write(task_port, address, (vm_offset_t)buffer, size);
+        }
+
+        static int (*original_strstr)(const char *, const char *) = NULL;
+        static void *(*original_dlsym)(void *, const char *) = NULL;
+
+        int hooked_strstr(const char *haystack, const char *needle) {
+            const char *blocked[] = {"cheat", "hack", "mod", "inject", "bypass", "aimbot", "wallhack", NULL};
+            for (int i = 0; blocked[i] != NULL; i++) {
+                if (strstr(haystack, blocked[i]) != NULL) {
+                    return 0;
+                }
+            }
+            return original_strstr(haystack, needle);
+        }
+
+        void *hooked_dlsym(void *handle, const char *symbol) {
+            if (strstr(symbol, "check") || strstr(symbol, "ban") || strstr(symbol, "detect")) {
+                return NULL;
+            }
+            return original_dlsym(handle, symbol);
+        }
+
+        static Vector3 calculate_angle(Vector3 source, Vector3 target) {
+            Vector3 delta;
+            delta.x = target.x - source.x;
+            delta.y = target.y - source.y;
+            delta.z = target.z - source.z;
+
+            float distance = sqrtf(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z);
+            Vector3 angle;
+            angle.x = atan2f(delta.y, delta.x) * 180.0f / M_PI;
+            angle.y = -asinf(delta.z / distance) * 180.0f / M_PI;
+            angle.z = 0.0f;
+            return angle;
+        }
+
+        static float calculate_distance(Vector3 a, Vector3 b) {
+            float dx = a.x - b.x;
+            float dy = a.y - b.y;
+            float dz = a.z - b.z;
+            return sqrtf(dx*dx + dy*dy + dz*dz);
+        }
+
+        static int is_within_fov(Vector3 current_angle, Vector3 target_angle, float fov) {
+            float diff_x = fabsf(current_angle.x - target_angle.x);
+            float diff_y = fabsf(current_angle.y - target_angle.y);
+            return (diff_x <= fov && diff_y <= fov);
+        }
+
+        static Vector3 smooth_aim(Vector3 current, Vector3 target, float smooth) {
+            Vector3 result;
+            result.x = current.x + (target.x - current.x) * smooth;
+            result.y = current.y + (target.y - current.y) * smooth;
+            result.z = 0.0f;
+            return result;
+        }
+
+        static int get_players(PlayerEntity *players, int max_players) {
+            if (OFFSET_ENTITY_LIST == 0 || OFFSET_PLAYER_COUNT == 0) return 0;
+            int player_count = 0;
+            vm_address_t addr = (vm_address_t)OFFSET_PLAYER_COUNT;
+            read_memory(addr, &player_count, sizeof(int));
+            if (player_count > max_players) player_count = max_players;
+
+            for (int i = 0; i < player_count; i++) {
+                vm_address_t entity_addr = (vm_address_t)(OFFSET_ENTITY_LIST + i * 0x100);
+                PlayerEntity *p = &players[i];
+                if (OFFSET_ENTITY_POS) read_memory(entity_addr + OFFSET_ENTITY_POS, &p->position, sizeof(Vector3));
+                if (OFFSET_ENTITY_HEAD) read_memory(entity_addr + OFFSET_ENTITY_HEAD, &p->head_position, sizeof(Vector3));
+                if (OFFSET_ENTITY_HEALTH) read_memory(entity_addr + OFFSET_ENTITY_HEALTH, &p->health, sizeof(float));
+                if (OFFSET_ENTITY_VISIBLE) read_memory(entity_addr + OFFSET_ENTITY_VISIBLE, &p->is_visible, sizeof(int));
+                if (OFFSET_ENTITY_TEAM) read_memory(entity_addr + OFFSET_ENTITY_TEAM, &p->team_id, sizeof(int));
+                if (OFFSET_ENTITY_ID) read_memory(entity_addr + OFFSET_ENTITY_ID, &p->player_id, sizeof(int));
+            }
+            return player_count;
+        }
+
+        static PlayerEntity* select_target(PlayerEntity *players, int count, CameraState *cam) {
+            if (count <= 0) return NULL;
+
+            PlayerEntity *best = NULL;
+            float best_score = 1e9f;
+
+            for (int i = 0; i < count; i++) {
+                PlayerEntity *p = &players[i];
+                if (p->health <= 0 || p->is_visible == 0) continue;
+                if (p->team_id == 0) continue;
+
+                Vector3 target_angle = calculate_angle(cam->camera_position, p->head_position);
+                Vector3 current_angle = cam->view_angles;
+
+                if (!is_within_fov(current_angle, target_angle, aim_fov)) continue;
+
+                float score;
+                if (target_priority == 0) {
+                    score = calculate_distance(cam->camera_position, p->position);
+                } else {
+                    score = p->health;
+                }
+
+                if (score < best_score) {
+                    best_score = score;
+                    best = p;
+                }
+            }
+            return best;
+        }
+
+        static int is_fire_button_pressed(void) {
+            if (OFFSET_FIRE_BUTTON == 0) return 0;
+            int fire_state = 0;
+            vm_address_t fire_addr = (vm_address_t)OFFSET_FIRE_BUTTON;
+            read_memory(fire_addr, &fire_state, sizeof(int));
+            return fire_state > 0;
+        }
+
+        static void* aim_loop(void *arg) {
+            thread_running = 1;
+
+            while (thread_running) {
+                if (!aimlock_enabled || OFFSET_VIEW_ANGLES == 0 || OFFSET_CAMERA_POS == 0) {
+                    usleep(10000);
+                    continue;
+                }
+
+                CameraState cam;
+                read_memory((vm_address_t)OFFSET_VIEW_ANGLES, &cam.view_angles, sizeof(Vector3));
+                read_memory((vm_address_t)OFFSET_CAMERA_POS, &cam.camera_position, sizeof(Vector3));
+                cam.fov = aim_fov;
+                cam.screen_width = 1080;
+                cam.screen_height = 1920;
+
+                PlayerEntity players[64];
+                int player_count = get_players(players, 64);
+
+                PlayerEntity *target = select_target(players, player_count, &cam);
+
+                if (target != NULL) {
+                    if (triggerbot_enabled && aim_key == 1) {
+                        if (!is_fire_button_pressed()) {
+                            usleep(5000);
+                            continue;
+                        }
+                    }
+
+                    Vector3 target_angle = calculate_angle(cam.camera_position, target->head_position);
+                    Vector3 smoothed = smooth_aim(cam.view_angles, target_angle, smooth_factor);
+
+                    write_memory((vm_address_t)OFFSET_VIEW_ANGLES, &smoothed, sizeof(Vector3));
+
+                    if (triggerbot_enabled && aim_key == 0 && OFFSET_FIRE_BUTTON) {
+                        float dist = calculate_distance(cam.camera_position, target->position);
+                        if (dist < 50.0f) {
+                            int fire_val = 1;
+                            vm_address_t fire_addr = (vm_address_t)OFFSET_FIRE_BUTTON;
+                            write_memory(fire_addr, &fire_val, sizeof(int));
+                            usleep(10000);
+                            fire_val = 0;
+                            write_memory(fire_addr, &fire_val, sizeof(int));
+                        }
+                    }
+                }
+
+                usleep(5000);
+            }
+            return NULL;
+        }
+
+        static void apply_anti_ban(void) {
+            original_strstr = dlsym(RTLD_NEXT, "strstr");
+            if (original_strstr) {
+                void **ptr = dlsym(RTLD_DEFAULT, "strstr");
+                if (ptr) *ptr = (void*)hooked_strstr;
+            }
+
+            original_dlsym = dlsym(RTLD_NEXT, "dlsym");
+            if (original_dlsym) {
+                void **ptr = dlsym(RTLD_DEFAULT, "dlsym");
+                if (ptr) *ptr = (void*)hooked_dlsym;
+            }
+
+            if (OFFSET_CRASH_FLAG) {
+                int flag = 0;
+                write_memory((vm_address_t)OFFSET_CRASH_FLAG, &flag, sizeof(int));
+            }
+
+            if (OFFSET_CHECK_FUNC) {
+                char nop[4] = {0x1F, 0x20, 0x03, 0xD5};
+                write_memory((vm_address_t)OFFSET_CHECK_FUNC, nop, sizeof(nop));
+            }
+        }
+
+        static void bypass_antiband(void) {
+            if (OFFSET_ACCELEROMETER) {
+                float fake_accel[3] = {0.0f, 0.0f, 0.0f};
+                write_memory((vm_address_t)OFFSET_ACCELEROMETER, fake_accel, sizeof(fake_accel));
+            }
+
+            if (OFFSET_TOUCH_SPEED) {
+                int touch_speed = 0;
+                write_memory((vm_address_t)OFFSET_TOUCH_SPEED, &touch_speed, sizeof(int));
+            }
+
+            if (OFFSET_SENSITIVITY) {
+                float sensitivity = 100.0f;
+                write_memory((vm_address_t)OFFSET_SENSITIVITY, &sensitivity, sizeof(float));
+            }
+
+            if (OFFSET_AIM_ASSIST) {
+                int aim_assist_bypass = 0xDEADBEEF;
+                write_memory((vm_address_t)OFFSET_AIM_ASSIST, &aim_assist_bypass, sizeof(int));
+            }
+        }
+
+        typedef struct {
+            vm_address_t address;
+            unsigned char *data;
+            size_t size;
+        } MemoryRegion;
+
+        static MemoryRegion *scan_regions = NULL;
+        static int region_count = 0;
+
+        static void scan_memory_regions(void) {
+            vm_address_t address = 0;
+            vm_size_t size = 0;
+            mach_msg_type_number_t info_count = 0;
+            struct vm_region_submap_info_64 info;
+            mach_port_t object_name;
+
+            while (1) {
+                kern_return_t kr = vm_region_64(task_port, &address, &size, VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_64_t)&info, &info_count, &object_name);
+                if (kr != KERN_SUCCESS) break;
+
+                if (info.protection & VM_PROT_READ) {
+                    scan_regions = realloc(scan_regions, sizeof(MemoryRegion) * (region_count + 1));
+                    scan_regions[region_count].address = address;
+                    scan_regions[region_count].size = size;
+                    scan_regions[region_count].data = malloc(size);
+                    read_memory(address, scan_regions[region_count].data, size);
+                    region_count++;
+                }
+                address += size;
+            }
+        }
+
+        static vm_address_t find_pattern(unsigned char *pattern, size_t pattern_len, vm_address_t start_addr, vm_address_t end_addr) {
+            for (int i = 0; i < region_count; i++) {
+                MemoryRegion *reg = &scan_regions[i];
+                if (reg->address < start_addr) continue;
+                if (end_addr > 0 && reg->address > end_addr) continue;
+
+                for (size_t j = 0; j < reg->size - pattern_len; j++) {
+                    int match = 1;
+                    for (size_t k = 0; k < pattern_len; k++) {
+                        if (pattern[k] == 0xCC) continue;
+                        if (reg->data[j + k] != pattern[k]) {
+                            match = 0;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        return reg->address + j;
+                    }
+                }
+            }
+            return 0;
+        }
+
+        static vm_address_t find_entity_list(void) {
+            unsigned char pattern[] = {0x00, 0x10, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC};
+            vm_address_t found = find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+            if (found) {
+                return found;
+            }
+
+            unsigned char pattern2[] = {0x01, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC};
+            found = find_pattern(pattern2, sizeof(pattern2), 0x100000000, 0);
+            return found;
+        }
+
+        static vm_address_t find_view_angles(void) {
+            unsigned char pattern[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F};
+            return find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+        }
+
+        static vm_address_t find_camera_position(void) {
+            unsigned char pattern[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            return find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+        }
+
+        static vm_address_t find_player_count(void) {
+            unsigned char pattern[] = {0x40, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC};
+            return find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+        }
+
+        static vm_address_t find_entity_position(void) {
+            unsigned char pattern[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            return find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+        }
+
+        static vm_address_t find_entity_health(void) {
+            unsigned char pattern[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            return find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+        }
+
+        static vm_address_t find_fire_button(void) {
+            unsigned char pattern[] = {0x01, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC};
+            return find_pattern(pattern, sizeof(pattern), 0x100000000, 0);
+        }
+
+        static void update_offsets(void) {
+            OFFSET_ENTITY_LIST = find_entity_list();
+            OFFSET_PLAYER_COUNT = find_player_count();
+            OFFSET_VIEW_ANGLES = find_view_angles();
+            OFFSET_CAMERA_POS = find_camera_position();
+            OFFSET_ENTITY_POS = find_entity_position();
+            OFFSET_ENTITY_HEALTH = find_entity_health();
+            OFFSET_FIRE_BUTTON = find_fire_button();
+
+            if (OFFSET_ENTITY_LIST) OFFSET_ENTITY_HEAD = OFFSET_ENTITY_LIST + 0x30;
+            if (OFFSET_ENTITY_LIST) OFFSET_ENTITY_VISIBLE = OFFSET_ENTITY_LIST + 0x20;
+            if (OFFSET_ENTITY_LIST) OFFSET_ENTITY_TEAM = OFFSET_ENTITY_LIST + 0x18;
+            if (OFFSET_ENTITY_LIST) OFFSET_ENTITY_ID = OFFSET_ENTITY_LIST + 0x10;
+
+            OFFSET_CRASH_FLAG = OFFSET_VIEW_ANGLES ? OFFSET_VIEW_ANGLES + 0x1000 : 0;
+            OFFSET_CHECK_FUNC = OFFSET_VIEW_ANGLES ? OFFSET_VIEW_ANGLES + 0x2000 : 0;
+            OFFSET_ACCELEROMETER = OFFSET_VIEW_ANGLES ? OFFSET_VIEW_ANGLES + 0x3000 : 0;
+            OFFSET_TOUCH_SPEED = OFFSET_VIEW_ANGLES ? OFFSET_VIEW_ANGLES + 0x4000 : 0;
+            OFFSET_SENSITIVITY = OFFSET_VIEW_ANGLES ? OFFSET_VIEW_ANGLES + 0x5000 : 0;
+            OFFSET_AIM_ASSIST = OFFSET_VIEW_ANGLES ? OFFSET_VIEW_ANGLES + 0x6000 : 0;
+
+            printf("[Aimlock] Offsets found - EL:0x%lx VC:0x%lx CP:0x%lx FB:0x%lx\n", 
+                   OFFSET_ENTITY_LIST, OFFSET_VIEW_ANGLES, OFFSET_CAMERA_POS, OFFSET_FIRE_BUTTON);
+        }
+
+        static int (*original_ptrace)(int, pid_t, caddr_t, int) = NULL;
+
+        int hooked_ptrace(int request, pid_t pid, caddr_t addr, int data) {
+            if (request == PT_DENY_ATTACH) {
+                return 0;
+            }
+            return original_ptrace(request, pid, addr, data);
+        }
+
+        static void apply_ptrace_bypass(void) {
+            original_ptrace = dlsym(RTLD_NEXT, "ptrace");
+            if (original_ptrace) {
+                void **ptr = dlsym(RTLD_DEFAULT, "ptrace");
+                if (ptr) *ptr = (void*)hooked_ptrace;
+            }
+        }
+
+        static Vector3 predict_movement(Vector3 current_pos, Vector3 velocity, float time) {
+            Vector3 predicted;
+            predicted.x = current_pos.x + velocity.x * time;
+            predicted.y = current_pos.y + velocity.y * time;
+            predicted.z = current_pos.z + velocity.z * time;
+            return predicted;
+        }
+
+        static int is_target_valid(PlayerEntity *p, CameraState *cam) {
+            if (p == NULL) return 0;
+            if (p->health <= 0 || p->health > 100.0f) return 0;
+            if (p->is_visible == 0) return 0;
+
+            Vector3 target_angle = calculate_angle(cam->camera_position, p->head_position);
+            Vector3 current_angle = cam->view_angles;
+
+            if (!is_within_fov(current_angle, target_angle, aim_fov * 0.5f)) return 0;
+
+            float dist = calculate_distance(cam->camera_position, p->position);
+            if (dist > 200.0f) return 0;
+
+            return 1;
+        }
+
+        static void optimize_loop_sleep(int fps_limit) {
+            static int frame_counter = 0;
+            frame_counter++;
+            if (frame_counter >= fps_limit) {
+                usleep(1000);
+                frame_counter = 0;
+            }
+        }
+
+        void load_config(const char *path) {
+            FILE *fp = fopen(path, "r");
+            if (!fp) return;
+
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                char key[64], value[64];
+                if (sscanf(line, "%s = %s", key, value) == 2) {
+                    if (strcmp(key, "fov") == 0) aim_fov = atof(value);
+                    if (strcmp(key, "smooth") == 0) smooth_factor = atof(value);
+                    if (strcmp(key, "priority") == 0) target_priority = atoi(value);
+                    if (strcmp(key, "triggerbot") == 0) triggerbot_enabled = atoi(value);
+                    if (strcmp(key, "aimkey") == 0) aim_key = atoi(value);
+                }
+            }
+            fclose(fp);
+        }
+
+        static int (*original_malloc)(size_t) = NULL;
+
+        int hooked_malloc(size_t size) {
+            if (size > 1024 * 1024 * 100) {
+                return (int)malloc(1024);
+            }
+            return (int)original_malloc(size);
+        }
+
+        static void apply_malloc_hook(void) {
+            original_malloc = dlsym(RTLD_NEXT, "malloc");
+            if (original_malloc) {
+                void **ptr = dlsym(RTLD_DEFAULT, "malloc");
+                if (ptr) *ptr = (void*)hooked_malloc;
+            }
+        }
+
+        static pthread_mutex_t aim_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+        void lock_aim(void) {
+            pthread_mutex_lock(&aim_mutex);
+        }
+
+        void unlock_aim(void) {
+            pthread_mutex_unlock(&aim_mutex);
+        }
+
+        __attribute__((constructor)) void init_aimlock() {
+            task_port = mach_task_self();
+
+            apply_ptrace_bypass();
+            apply_malloc_hook();
+
+            scan_memory_regions();
+            update_offsets();
+
+            apply_anti_ban();
+            bypass_antiband();
+
+            load_config("/var/mobile/Library/aimlock.cfg");
+
+            pthread_create(&aim_thread, NULL, aim_loop, NULL);
+
+            printf("[Aimlock] Full initialization complete - %d regions scanned\n", region_count);
+        }
+
+        __attribute__((destructor)) void cleanup_aimlock() {
+            thread_running = 0;
+            pthread_join(aim_thread, NULL);
+            printf("[Aimlock] Unloaded\n");
+        }
+
+        int enable_aimlock(void) {
+            aimlock_enabled = 1;
+            return 1;
+        }
+
+        int disable_aimlock(void) {
+            aimlock_enabled = 0;
+            return 0;
+        }
+
+        int set_fov(float fov) {
+            if (fov < 1.0f) fov = 1.0f;
+            if (fov > 90.0f) fov = 90.0f;
+            aim_fov = fov;
+            return 1;
+        }
+
+        int set_smooth(float smooth) {
+            if (smooth < 0.01f) smooth = 0.01f;
+            if (smooth > 1.0f) smooth = 1.0f;
+            smooth_factor = smooth;
+            return 1;
+        }
+
+        int set_priority(int priority) {
+            target_priority = (priority >= 0 && priority <= 1) ? priority : 0;
+            return 1;
+        }
+
+        int toggle_triggerbot(void) {
+            triggerbot_enabled = !triggerbot_enabled;
+            return triggerbot_enabled;
+        }
+
+        int get_status(void) {
+            return aimlock_enabled ? 1 : 0;
+        }
+
+        vm_address_t get_offset(const char *name) {
+            if (strcmp(name, "entity_list") == 0) return OFFSET_ENTITY_LIST;
+            if (strcmp(name, "view_angles") == 0) return OFFSET_VIEW_ANGLES;
+            if (strcmp(name, "camera_pos") == 0) return OFFSET_CAMERA_POS;
+            if (strcmp(name, "fire_button") == 0) return OFFSET_FIRE_BUTTON;
+            if (strcmp(name, "player_count") == 0) return OFFSET_PLAYER_COUNT;
+            if (strcmp(name, "entity_pos") == 0) return OFFSET_ENTITY_POS;
+            if (strcmp(name, "entity_health") == 0) return OFFSET_ENTITY_HEALTH;
+            return 0;
+        }
+
+        void set_offset(const char *name, vm_address_t value) {
+            if (strcmp(name, "entity_list") == 0) OFFSET_ENTITY_LIST = value;
+            if (strcmp(name, "view_angles") == 0) OFFSET_VIEW_ANGLES = value;
+            if (strcmp(name, "camera_pos") == 0) OFFSET_CAMERA_POS = value;
+            if (strcmp(name, "fire_button") == 0) OFFSET_FIRE_BUTTON = value;
+            if (strcmp(name, "player_count") == 0) OFFSET_PLAYER_COUNT = value;
+            if (strcmp(name, "entity_pos") == 0) OFFSET_ENTITY_POS = value;
+            if (strcmp(name, "entity_health") == 0) OFFSET_ENTITY_HEALTH = value;
+        }
+
+        void force_rescan(void) {
+            for (int i = 0; i < region_count; i++) {
+                free(scan_regions[i].data);
+            }
+            free(scan_regions);
+            scan_regions = NULL;
+            region_count = 0;
+            scan_memory_regions();
+            update_offsets();
+        }
+        EOF
+
+    - name: Compile for iOS arm64
+      run: |
+        gcc -arch arm64 -shared -fPIC -o libaimlock.dylib aimlock.c \
+          -framework Foundation \
+          -framework UIKit \
+          -framework CoreGraphics \
+          -framework QuartzCore \
+          -Wall -Wextra -O2 -mios-version-min=13.0
+
+    - name: Upload dylib artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: libaimlock
+        path: libaimlock.dylib
